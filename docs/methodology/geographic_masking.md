@@ -79,3 +79,37 @@ These properties must be stored and interpreted separately.
 4. Maintain separate land and study-area classifications.
 5. Integrate the validated mask with the data-processing pipeline.
 6. Apply appropriate spatial weighting for regional climate statistics.
+
+## 10. Spatial Coverage Audit
+
+The initial ERA5 sample covers 34–72°N and 25°W–45°E.
+
+A spatial coverage audit was performed using Natural Earth 1:50m country boundaries.
+
+### Results
+
+| Metric | Value |
+|---|---:|
+| Total selected polygon area | 22,968,010 km² |
+| Area outside ERA5 bounding box | 15,096,185 km² |
+| Uncovered fraction | 65.73% |
+| Russian polygon area outside the box | 14,934,874 km² |
+| Uncovered fraction excluding Russia | 2.69% |
+
+### Interpretation
+
+Most of the uncovered area is associated with the Russian polygon, which extends far beyond geographic Europe.
+
+The calculation also includes some overseas territories and islands.
+
+These results should not be interpreted as the percentage of geographic Europe missing from the ERA5 sample.
+
+### Methodological Decision
+
+The current 50m mask will remain a preliminary implementation.
+
+Before downloading the full historical dataset, the study must establish an explicit geographic definition of Europe, including the treatment of transcontinental countries and overseas territories.
+
+The final ERA5 download bounds must fully cover the agreed study area.
+
+No modifications to the MySQL land-mask column will be made until that definition has been finalized.
