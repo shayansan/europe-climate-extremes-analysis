@@ -13,7 +13,7 @@ import xarray as xr
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Process ERA5 daily maximum temperatures."
+        description="Process ERA5 daily temperature statistics."
     )
 
     parser.add_argument(
@@ -29,6 +29,13 @@ def parse_args():
         type=Path,
         required=True,
         help="Output CSV path",
+    )
+
+    parser.add_argument(
+        "--statistic",
+        choices=["tmax", "tmean"],
+        default="tmax",
+        help="Input daily statistic (default: tmax)",
     )
 
     parser.add_argument(
@@ -71,6 +78,9 @@ def read_grid(ds):
     latitudes = temperature.latitude.values.copy()
     longitudes = temperature.longitude.values.copy()
 
+    if latitudes.size == 0 or longitudes.size == 0:
+        raise ValueError("Empty geographic grid")
+
     return temperature, latitudes, longitudes
 
 
@@ -108,15 +118,27 @@ def create_spatial_mask(latitudes, longitudes, boundaries):
     if not mask.any():
         raise ValueError("No cells inside study area")
 
-    weights = np.cos(
-        np.deg2rad(lat_grid)
-    )
+    weights = np.cos(np.deg2rad(lat_grid))
+
+    if not np.all(np.isfinite(weights[mask])):
+        raise ValueError("Non-finite spatial weights")
+
+    if np.any(weights[mask] <= 0):
+        raise ValueError("Spatial weights must be positive")
 
     return mask, weights, lat_grid, lon_grid
 
 
-def process_temperature(temperature, mask, weights):
+def process_temperature(temperature, mask, weights, statistic):
     rows = []
+
+    mean_column = f"weighted_mean_{statistic}_c"
+
+    maximum_column = (
+        "maximum_tmax_c"
+        if statistic == "tmax"
+        else "maximum_gridcell_tmean_c"
+    )
 
     for index, timestamp in enumerate(
         temperature.valid_time.values
@@ -131,25 +153,23 @@ def process_temperature(temperature, mask, weights):
 
         if not valid.any():
             raise ValueError(
-                f"No valid observations: {timestamp}"
+                f"No valid temperature observations: {timestamp}"
             )
 
         values = day[valid]
         day_weights = weights[valid]
 
-        date = pd.Timestamp(timestamp).date()
-
         rows.append({
-            "date": date,
+            "date": pd.Timestamp(timestamp).date(),
             "valid_cells": int(valid.sum()),
-            "weighted_mean_tmax_c": round(
+            mean_column: round(
                 float(np.average(
                     values,
                     weights=day_weights,
                 )),
                 3,
             ),
-            "maximum_tmax_c": round(
+            maximum_column: round(
                 float(values.max()),
                 3,
             ),
@@ -195,13 +215,11 @@ def write_csv_atomic(dataframe, output_path):
 def main():
     args = parse_args()
 
-    paths = [*args.input, args.boundaries]
+    required_paths = [*args.input, args.boundaries]
 
-    for path in paths:
+    for path in required_paths:
         if not path.is_file():
-            raise FileNotFoundError(
-                f"File not found: {path}"
-            )
+            raise FileNotFoundError(f"File not found: {path}")
 
     resolved_paths = [
         path.resolve() for path in args.input
@@ -212,7 +230,9 @@ def main():
             "The same input file was provided more than once"
         )
 
-    print("=== OPTIMIZED ERA5 PIPELINE ===", flush=True)
+    print("=== ERA5 TEMPERATURE PIPELINE ===", flush=True)
+    print("Statistic:", args.statistic)
+    print("Number of files:", len(args.input))
 
     reference_latitudes = None
     reference_longitudes = None
@@ -237,7 +257,10 @@ def main():
                 reference_latitudes = latitudes
                 reference_longitudes = longitudes
 
-                print("Generating geographic mask once...")
+                print(
+                    "Generating geographic mask once...",
+                    flush=True,
+                )
 
                 mask, weights, lat_grid, lon_grid = (
                     create_spatial_mask(
@@ -268,6 +291,7 @@ def main():
                 temperature,
                 mask,
                 weights,
+                args.statistic,
             )
 
             results.append(result)
@@ -294,7 +318,6 @@ def main():
         "date"
     ).reset_index(drop=True)
 
-    # Write outputs only after processing and validation.
     if args.mask_output is not None:
         mask_df = pd.DataFrame({
             "latitude": lat_grid.ravel(),
@@ -313,11 +336,12 @@ def main():
     )
 
     print("\n=== PROCESSING SUMMARY ===")
-    print(f"Files processed: {len(args.input)}")
-    print(f"Total days: {len(combined)}")
-    print(f"First date: {combined['date'].min()}")
-    print(f"Last date: {combined['date'].max()}")
-    print(f"Output: {args.output}")
+    print("Statistic:", args.statistic)
+    print("Files processed:", len(args.input))
+    print("Total days:", len(combined))
+    print("First date:", combined["date"].min())
+    print("Last date:", combined["date"].max())
+    print("Output:", args.output)
     print("\n=== PIPELINE COMPLETED SUCCESSFULLY ===")
 
 
