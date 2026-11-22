@@ -11,6 +11,11 @@ import shapely
 import xarray as xr
 
 
+DEFAULT_BOUNDARIES = Path(
+    "data/raw/boundaries/ne_50m_admin_0_countries.zip"
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Process ERA5 daily temperature statistics."
@@ -35,33 +40,44 @@ def parse_args():
         "--statistic",
         choices=["tmax", "tmean"],
         default="tmax",
-        help="Input daily statistic (default: tmax)",
+        help="Input temperature statistic",
     )
 
     parser.add_argument(
         "--boundaries",
         type=Path,
-        default=Path(
-            "data/raw/boundaries/"
-            "ne_50m_admin_0_countries.zip"
-        ),
+        default=DEFAULT_BOUNDARIES,
+        help="Natural Earth boundaries for legacy mode",
+    )
+
+    parser.add_argument(
+        "--study-area",
+        type=Path,
+        default=None,
+        help="Optional custom study-area GeoJSON",
     )
 
     parser.add_argument(
         "--mask-output",
         type=Path,
         default=None,
-        help="Optional geographic mask CSV",
+        help="Optional CSV containing the geographic mask",
     )
 
     return parser.parse_args()
 
 
 def read_grid(ds):
-    required = {"valid_time", "latitude", "longitude"}
+    required_coordinates = {
+        "valid_time",
+        "latitude",
+        "longitude",
+    }
 
-    if not required.issubset(ds.coords):
-        raise ValueError("Missing required ERA5 coordinates")
+    if not required_coordinates.issubset(ds.coords):
+        raise ValueError(
+            "Missing required ERA5 coordinates"
+        )
 
     if "t2m" not in ds:
         raise ValueError("Missing t2m variable")
@@ -73,7 +89,9 @@ def read_grid(ds):
     )
 
     if temperature.attrs.get("units") != "K":
-        raise ValueError("Expected temperature units: K")
+        raise ValueError(
+            "Expected temperature units: K"
+        )
 
     latitudes = temperature.latitude.values.copy()
     longitudes = temperature.longitude.values.copy()
@@ -84,26 +102,79 @@ def read_grid(ds):
     return temperature, latitudes, longitudes
 
 
-def create_spatial_mask(latitudes, longitudes, boundaries):
-    world = gpd.read_file(boundaries)
+def load_study_geometry(boundaries, study_area):
+    if study_area is not None:
+        if not study_area.is_file():
+            raise FileNotFoundError(study_area)
 
-    if world.crs is None:
-        raise ValueError("Boundary CRS is missing")
+        geographic = gpd.read_file(study_area)
 
-    world = world.to_crs("EPSG:4326")
+        if len(geographic) != 1:
+            raise ValueError(
+                "Study-area file must contain exactly one feature"
+            )
 
-    if "CONTINENT" not in world.columns:
-        raise ValueError("Missing CONTINENT field")
+        if geographic.crs is None:
+            raise ValueError(
+                "Study-area CRS is missing"
+            )
 
-    europe = world.loc[
-        world["CONTINENT"] == "Europe"
-    ]
+        geographic = geographic.to_crs("EPSG:4326")
 
-    if europe.empty:
-        raise ValueError("No European polygons found")
+        geometry = geographic.geometry.iloc[0]
 
-    geometry = europe.geometry.union_all()
+        print("Geographic mode: custom study area")
+        print("Study area:", study_area)
 
+    else:
+        if not boundaries.is_file():
+            raise FileNotFoundError(boundaries)
+
+        world = gpd.read_file(boundaries)
+
+        if world.crs is None:
+            raise ValueError(
+                "Boundary CRS is missing"
+            )
+
+        world = world.to_crs("EPSG:4326")
+
+        if "CONTINENT" not in world.columns:
+            raise ValueError(
+                "Missing CONTINENT field"
+            )
+
+        europe = world.loc[
+            world["CONTINENT"] == "Europe"
+        ]
+
+        if europe.empty:
+            raise ValueError(
+                "No European polygons found"
+            )
+
+        geometry = europe.geometry.union_all()
+
+        print("Geographic mode: legacy Natural Earth")
+
+    if geometry is None or geometry.is_empty:
+        raise ValueError(
+            "Study-area geometry is empty"
+        )
+
+    if not geometry.is_valid:
+        raise ValueError(
+            "Study-area geometry is invalid"
+        )
+
+    return geometry
+
+
+def create_spatial_mask(
+    latitudes,
+    longitudes,
+    geometry,
+):
     lon_grid, lat_grid = np.meshgrid(
         longitudes,
         latitudes,
@@ -116,29 +187,45 @@ def create_spatial_mask(latitudes, longitudes, boundaries):
     )
 
     if not mask.any():
-        raise ValueError("No cells inside study area")
+        raise ValueError(
+            "No grid cells inside study area"
+        )
 
-    weights = np.cos(np.deg2rad(lat_grid))
+    weights = np.cos(
+        np.deg2rad(lat_grid)
+    )
 
-    if not np.all(np.isfinite(weights[mask])):
-        raise ValueError("Non-finite spatial weights")
+    if not np.all(
+        np.isfinite(weights[mask])
+    ):
+        raise ValueError(
+            "Non-finite spatial weights"
+        )
 
     if np.any(weights[mask] <= 0):
-        raise ValueError("Spatial weights must be positive")
+        raise ValueError(
+            "Spatial weights must be positive"
+        )
 
     return mask, weights, lat_grid, lon_grid
 
 
-def process_temperature(temperature, mask, weights, statistic):
+def process_temperature(
+    temperature,
+    mask,
+    weights,
+    statistic,
+):
     rows = []
 
-    mean_column = f"weighted_mean_{statistic}_c"
-
-    maximum_column = (
-        "maximum_tmax_c"
-        if statistic == "tmax"
-        else "maximum_gridcell_tmean_c"
+    mean_column = (
+        f"weighted_mean_{statistic}_c"
     )
+
+    if statistic == "tmax":
+        maximum_column = "maximum_tmax_c"
+    else:
+        maximum_column = "maximum_gridcell_tmean_c"
 
     for index, timestamp in enumerate(
         temperature.valid_time.values
@@ -149,39 +236,57 @@ def process_temperature(temperature, mask, weights, statistic):
             - 273.15
         )
 
-        valid = mask & np.isfinite(day)
+        valid = (
+            mask
+            & np.isfinite(day)
+        )
 
         if not valid.any():
             raise ValueError(
-                f"No valid temperature observations: {timestamp}"
+                f"No valid observations: {timestamp}"
             )
 
         values = day[valid]
         day_weights = weights[valid]
 
-        rows.append({
-            "date": pd.Timestamp(timestamp).date(),
-            "valid_cells": int(valid.sum()),
-            mean_column: round(
-                float(np.average(
-                    values,
-                    weights=day_weights,
-                )),
-                3,
-            ),
-            maximum_column: round(
-                float(values.max()),
-                3,
-            ),
-        })
+        weighted_mean = float(
+            np.average(
+                values,
+                weights=day_weights,
+            )
+        )
+
+        maximum_value = float(
+            values.max()
+        )
+
+        rows.append(
+            {
+                "date": pd.Timestamp(timestamp).date(),
+                "valid_cells": int(valid.sum()),
+                mean_column: round(
+                    weighted_mean,
+                    3,
+                ),
+                maximum_column: round(
+                    maximum_value,
+                    3,
+                ),
+            }
+        )
 
     if not rows:
-        raise ValueError("Input contains no observation days")
+        raise ValueError(
+            "Input contains no observation days"
+        )
 
     return pd.DataFrame(rows)
 
 
-def write_csv_atomic(dataframe, output_path):
+def write_csv_atomic(
+    dataframe,
+    output_path,
+):
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -192,17 +297,26 @@ def write_csv_atomic(dataframe, output_path):
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
+            encoding="utf-8",
+            newline="",
             suffix=".csv",
             prefix=".era5_tmp_",
             dir=output_path.parent,
             delete=False,
-            encoding="utf-8",
-            newline="",
         ) as temporary:
-            temporary_path = Path(temporary.name)
-            dataframe.to_csv(temporary, index=False)
+            temporary_path = Path(
+                temporary.name
+            )
 
-        os.replace(temporary_path, output_path)
+            dataframe.to_csv(
+                temporary,
+                index=False,
+            )
+
+        os.replace(
+            temporary_path,
+            output_path,
+        )
 
     finally:
         if (
@@ -215,24 +329,32 @@ def write_csv_atomic(dataframe, output_path):
 def main():
     args = parse_args()
 
-    required_paths = [*args.input, args.boundaries]
-
-    for path in required_paths:
-        if not path.is_file():
-            raise FileNotFoundError(f"File not found: {path}")
-
-    resolved_paths = [
-        path.resolve() for path in args.input
+    resolved_inputs = [
+        path.resolve()
+        for path in args.input
     ]
 
-    if len(set(resolved_paths)) != len(resolved_paths):
+    if len(set(resolved_inputs)) != len(resolved_inputs):
         raise ValueError(
-            "The same input file was provided more than once"
+            "Duplicate input file paths"
         )
 
-    print("=== ERA5 TEMPERATURE PIPELINE ===", flush=True)
+    for path in args.input:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    print(
+        "=== ERA5 TEMPERATURE PIPELINE ===",
+        flush=True,
+    )
+
     print("Statistic:", args.statistic)
     print("Number of files:", len(args.input))
+
+    geometry = load_study_geometry(
+        args.boundaries,
+        args.study_area,
+    )
 
     reference_latitudes = None
     reference_longitudes = None
@@ -244,14 +366,21 @@ def main():
 
     results = []
 
-    for index, path in enumerate(args.input, start=1):
+    for index, path in enumerate(
+        args.input,
+        start=1,
+    ):
         print(
             f"\n[{index}/{len(args.input)}] {path}",
             flush=True,
         )
 
         with xr.open_dataset(path) as ds:
-            temperature, latitudes, longitudes = read_grid(ds)
+            (
+                temperature,
+                latitudes,
+                longitudes,
+            ) = read_grid(ds)
 
             if reference_latitudes is None:
                 reference_latitudes = latitudes
@@ -262,26 +391,36 @@ def main():
                     flush=True,
                 )
 
-                mask, weights, lat_grid, lon_grid = (
-                    create_spatial_mask(
-                        latitudes,
-                        longitudes,
-                        args.boundaries,
-                    )
+                (
+                    mask,
+                    weights,
+                    lat_grid,
+                    lon_grid,
+                ) = create_spatial_mask(
+                    latitudes,
+                    longitudes,
+                    geometry,
                 )
 
                 print(
-                    f"Selected grid cells: {int(mask.sum()):,}"
+                    "Selected grid cells:",
+                    int(mask.sum()),
                 )
 
             else:
-                if (
-                    not np.array_equal(
-                        latitudes, reference_latitudes
-                    )
-                    or not np.array_equal(
-                        longitudes, reference_longitudes
-                    )
+                latitude_matches = np.array_equal(
+                    latitudes,
+                    reference_latitudes,
+                )
+
+                longitude_matches = np.array_equal(
+                    longitudes,
+                    reference_longitudes,
+                )
+
+                if not (
+                    latitude_matches
+                    and longitude_matches
                 ):
                     raise ValueError(
                         "Input files have incompatible geographic grids"
@@ -296,37 +435,50 @@ def main():
 
             results.append(result)
 
-            print(f"Processed days: {len(result)}")
+            print(
+                "Processed days:",
+                len(result),
+            )
 
     combined = pd.concat(
         results,
         ignore_index=True,
     )
 
-    duplicates = combined.loc[
-        combined["date"].duplicated(keep=False),
+    duplicate_dates = combined.loc[
+        combined["date"].duplicated(
+            keep=False
+        ),
         "date",
     ].drop_duplicates()
 
-    if not duplicates.empty:
+    if not duplicate_dates.empty:
         raise ValueError(
             "Duplicate dates across input files: "
-            + ", ".join(map(str, sorted(duplicates)))
+            + ", ".join(
+                map(
+                    str,
+                    sorted(duplicate_dates),
+                )
+            )
         )
 
-    combined = combined.sort_values(
-        "date"
-    ).reset_index(drop=True)
+    combined = (
+        combined.sort_values("date")
+        .reset_index(drop=True)
+    )
 
     if args.mask_output is not None:
-        mask_df = pd.DataFrame({
-            "latitude": lat_grid.ravel(),
-            "longitude": lon_grid.ravel(),
-            "in_study_area": mask.ravel(),
-        })
+        mask_dataframe = pd.DataFrame(
+            {
+                "latitude": lat_grid.ravel(),
+                "longitude": lon_grid.ravel(),
+                "in_study_area": mask.ravel(),
+            }
+        )
 
         write_csv_atomic(
-            mask_df,
+            mask_dataframe,
             args.mask_output,
         )
 
@@ -335,14 +487,29 @@ def main():
         args.output,
     )
 
-    print("\n=== PROCESSING SUMMARY ===")
+    print(
+        "\n=== PROCESSING SUMMARY ==="
+    )
+
     print("Statistic:", args.statistic)
-    print("Files processed:", len(args.input))
+    print(
+        "Files processed:",
+        len(args.input),
+    )
     print("Total days:", len(combined))
-    print("First date:", combined["date"].min())
-    print("Last date:", combined["date"].max())
+    print(
+        "First date:",
+        combined["date"].min(),
+    )
+    print(
+        "Last date:",
+        combined["date"].max(),
+    )
     print("Output:", args.output)
-    print("\n=== PIPELINE COMPLETED SUCCESSFULLY ===")
+
+    print(
+        "\n=== PIPELINE COMPLETED SUCCESSFULLY ==="
+    )
 
 
 if __name__ == "__main__":
