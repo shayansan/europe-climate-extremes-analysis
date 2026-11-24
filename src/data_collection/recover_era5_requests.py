@@ -1,6 +1,12 @@
 
 import argparse
 import json
+from pathlib import Path
+
+from src.data_collection.manifest_runtime import (
+    manifest_session,
+    validate_manifest_scope,
+)
 from collections import defaultdict
 
 from src.data_collection.manage_era5_downloads import (
@@ -103,70 +109,60 @@ def main():
         help="Save unambiguous matches to the manifest",
     )
 
-    args = parser.parse_args()
-
-    manifest = load_manifest()
-    client = create_client()
-
-    print("=== ERA5 REQUEST RECOVERY ===")
-    print("Mode:", "APPLY" if args.apply else "DRY RUN")
-
-    remotes = discover_requests(client)
-
-    print("Server requests discovered:", len(remotes))
-    print("Manifest jobs:", len(manifest["jobs"]))
-
-    matches = find_matches(manifest, remotes)
-
-    recovered = 0
-    ambiguous = 0
-
-    for job in manifest["jobs"]:
-        if job.get("request_id"):
-            continue
-
-        candidates = matches.get(job["job_id"], [])
-
-        if not candidates:
-            continue
-
-        if len(candidates) > 1:
-            ambiguous += 1
-            print(
-                "AMBIGUOUS:",
-                job["job_id"],
-                "matches:",
-                len(candidates),
-            )
-            continue
-
-        remote = candidates[0]
-
-        print(
-            "MATCH:",
-            job["job_id"],
-            "->",
-            remote.request_id,
-            f"({remote.status})",
-        )
-
-        recovered += 1
-
-        if args.apply:
-            job["request_id"] = remote.request_id
-            job["status"] = remote.status
-
-            # Persist after each recovered request.
-            save_manifest(manifest)
-
-    print("\n=== SUMMARY ===")
-    print("Unambiguous matches:", recovered)
-    print("Ambiguous jobs:", ambiguous)
-    print(
-        "Manifest updated:",
-        "YES" if args.apply and recovered else "NO",
+    parser.add_argument(
+        "--manifest", type=Path,
+        default=Path("data/interim/era5_download_manifest.json"),
+        help="Manifest JSON path",
     )
-    print("New requests submitted: 0")
+
+    args = parser.parse_args()
+    with manifest_session(args.manifest):
+        manifest = load_manifest()
+        validate_manifest_scope(manifest)
+        client = create_client()
+
+        print("=== ERA5 REQUEST RECOVERY ===")
+        print("Mode:", "APPLY" if args.apply else "DRY RUN")
+
+        remotes = discover_requests(client)
+
+        print("Server requests discovered:", len(remotes))
+        print("Manifest jobs:", len(manifest["jobs"]))
+
+        matches = find_matches(manifest, remotes)
+
+        recovered = 0
+        ambiguous = 0
+
+        for job in manifest["jobs"]:
+            if job.get("request_id"):
+                continue
+
+            candidates = matches.get(job["job_id"], [])
+
+            if not candidates:
+                continue
+
+            if len(candidates) > 1:
+                ambiguous += 1
+                print("AMBIGUOUS:", job["job_id"], "matches:", len(candidates))
+                continue
+
+            remote = candidates[0]
+            print("MATCH:", job["job_id"], "->", remote.request_id, f"({remote.status})")
+            recovered += 1
+
+            if args.apply:
+                job["request_id"] = remote.request_id
+                job["status"] = remote.status
+                save_manifest(manifest)
+
+        print("\n=== SUMMARY ===")
+        print("Unambiguous matches:", recovered)
+        print("Ambiguous jobs:", ambiguous)
+        print("Manifest updated:", "YES" if args.apply and recovered else "NO")
+        print("New requests submitted: 0")
+
 
 
 if __name__ == "__main__":

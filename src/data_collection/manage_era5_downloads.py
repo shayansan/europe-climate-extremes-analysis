@@ -11,6 +11,12 @@ import numpy as np
 import xarray as xr
 from ecmwf.datastores import Client
 
+from src.data_collection.manifest_runtime import (
+    current_manifest_path,
+    manifest_session,
+    validate_manifest_scope,
+)
+
 
 MANIFEST_PATH = Path(
     "data/interim/era5_download_manifest.json"
@@ -24,15 +30,17 @@ def now_utc():
 
 
 def load_manifest():
-    if not MANIFEST_PATH.exists():
-        raise FileNotFoundError(MANIFEST_PATH)
+    path = current_manifest_path(MANIFEST_PATH)
+    if not path.exists():
+        raise FileNotFoundError(path)
 
-    with MANIFEST_PATH.open(encoding="utf-8") as f:
+    with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_manifest(manifest):
-    MANIFEST_PATH.parent.mkdir(
+    path = current_manifest_path(MANIFEST_PATH)
+    path.parent.mkdir(
         parents=True, exist_ok=True
     )
 
@@ -42,7 +50,7 @@ def save_manifest(manifest):
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=MANIFEST_PATH.parent,
+            dir=path.parent,
             prefix=".manifest_",
             suffix=".json",
             delete=False,
@@ -53,7 +61,7 @@ def save_manifest(manifest):
             f.flush()
             os.fsync(f.fileno())
 
-        os.replace(temporary, MANIFEST_PATH)
+        os.replace(temporary, path)
 
     finally:
         if temporary is not None:
@@ -316,37 +324,37 @@ def main():
     )
 
     parser.add_argument("--job", type=str)
+    parser.add_argument(
+        "--manifest", type=Path, default=MANIFEST_PATH,
+        help="Manifest JSON path (default: original pilot manifest)",
+    )
 
     args = parser.parse_args()
 
-    manifest = load_manifest()
+    with manifest_session(args.manifest):
+        manifest = load_manifest()
+        validate_manifest_scope(manifest)
 
-    if args.action == "list":
-        show_jobs(manifest)
-        return
+        if args.action == "list":
+            show_jobs(manifest)
+            return
 
-    if not args.job:
-        parser.error("--job is required for this action")
+        if not args.job:
+            parser.error("--job is required for this action")
 
-    job = get_job(manifest, args.job)
+        job = get_job(manifest, args.job)
+        client = create_client()
 
-    if manifest.get("geographic_scope") != (
-        "pilot_bbox_not_final_europe"
-    ):
-        raise ValueError(
-            "Unexpected geographic scope: review manifest"
-        )
+        if args.action == "submit":
+            # The CLI MUST NOT invoke the unsafe submit_job directly.
+            from src.data_collection.safe_submit_era5 import safe_submit
+            outcome = safe_submit(client, manifest, job)
+            print("Outcome:", outcome)
+        elif args.action == "status":
+            check_job(client, manifest, job)
+        elif args.action == "download":
+            download_job(client, manifest, job)
 
-    client = create_client()
-
-    if args.action == "submit":
-        submit_job(client, manifest, job)
-
-    elif args.action == "status":
-        check_job(client, manifest, job)
-
-    elif args.action == "download":
-        download_job(client, manifest, job)
 
 
 if __name__ == "__main__":

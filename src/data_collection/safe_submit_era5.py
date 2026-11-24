@@ -1,5 +1,11 @@
 
 import argparse
+from pathlib import Path
+
+from src.data_collection.manifest_runtime import (
+    manifest_session,
+    validate_manifest_scope,
+)
 
 from src.data_collection.manage_era5_downloads import (
     create_client,
@@ -114,24 +120,21 @@ def main():
         help="Manifest job ID, e.g. 2020-01-tmax",
     )
 
+    parser.add_argument(
+        "--manifest", type=Path,
+        default=Path("data/interim/era5_download_manifest.json"),
+        help="Manifest JSON path",
+    )
+
     args = parser.parse_args()
 
-    manifest = load_manifest()
-
-    if manifest.get("geographic_scope") != (
-        "pilot_bbox_not_final_europe"
-    ):
-        raise ValueError(
-            "Unexpected geographic scope. "
-            "Review the manifest before submitting."
-        )
-
-    job = get_job(manifest, args.job)
-    client = create_client()
-
-    outcome = safe_submit(client, manifest, job)
-
-    print("Outcome:", outcome)
+    with manifest_session(args.manifest):
+        manifest = load_manifest()
+        validate_manifest_scope(manifest)
+        job = get_job(manifest, args.job)
+        client = create_client()
+        outcome = safe_submit(client, manifest, job)
+        print("Outcome:", outcome)
 
 
 if __name__ == "__main__":
