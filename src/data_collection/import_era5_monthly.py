@@ -132,40 +132,129 @@ def prepare_grid_ids(cursor, coords):
 
 def import_month(connection, temperature, mask, latitudes, longitudes, statistic):
     cursor = connection.cursor()
+
     try:
         dataset_id = get_or_insert_dataset(cursor, statistic)
         coords = selected_coordinates(latitudes, longitudes, mask)
         grid_ids = prepare_grid_ids(cursor, coords)
+
         inserted = 0
         attempted = 0
+        tolerance_c = 0.001
+
         for day_index, timestamp in enumerate(temperature.valid_time.values):
             date = str(np.datetime64(timestamp, 'D'))
-            values = np.asarray(temperature.isel(valid_time=day_index).values)[mask]
-            records = [(dataset_id, grid_id, date, float(kelvin) - 273.15)
-                       for grid_id, kelvin in zip(grid_ids, values)]
+            values = np.asarray(
+                temperature.isel(valid_time=day_index).values
+            )[mask]
+
+            records = [
+                (dataset_id, grid_id, date, float(kelvin) - 273.15)
+                for grid_id, kelvin in zip(grid_ids, values)
+            ]
+
             attempted += len(records)
+
             for start in range(0, len(records), BATCH_SIZE):
-                cursor.executemany('''
-                    INSERT IGNORE INTO daily_temperatures
-                    (dataset_id,grid_cell_id,observation_date,temperature_c)
-                    VALUES (%s,%s,%s,%s)
-                ''', records[start:start + BATCH_SIZE])
-                inserted += cursor.rowcount
-        # Check existing coverage, including idempotent re-runs, before commit.
-        first_date = str(np.datetime64(temperature.valid_time.values[0], 'D'))
-        last_date = str(np.datetime64(temperature.valid_time.values[-1], 'D'))
-        cursor.execute('''
-            SELECT COUNT(*) FROM daily_temperatures
-            WHERE dataset_id=%s AND observation_date BETWEEN %s AND %s
-        ''', (dataset_id, first_date, last_date))
+                batch = records[start:start + BATCH_SIZE]
+                batch_ids = [record[1] for record in batch]
+
+                placeholders = ",".join(["%s"] * len(batch_ids))
+
+                cursor.execute(
+                    f"""
+                    SELECT grid_cell_id, temperature_c
+                    FROM daily_temperatures
+                    WHERE dataset_id = %s
+                      AND observation_date = %s
+                      AND grid_cell_id IN ({placeholders})
+                    """,
+                    (dataset_id, date, *batch_ids),
+                )
+
+                existing_rows = cursor.fetchall()
+
+                if len(existing_rows) != len({
+                    row[0] for row in existing_rows
+                }):
+                    raise ValueError(
+                        f"Duplicate database grid IDs on {date}"
+                    )
+
+                existing = {
+                    row[0]: float(row[1])
+                    for row in existing_rows
+                }
+
+                new_records = []
+
+                for record in batch:
+                    _, grid_id, _, incoming_c = record
+
+                    if grid_id not in existing:
+                        new_records.append(record)
+                        continue
+
+                    stored_c = existing[grid_id]
+
+                    if abs(stored_c - incoming_c) > tolerance_c:
+                        raise ValueError(
+                            "Conflicting temperature: "
+                            f"dataset={dataset_id}, "
+                            f"grid={grid_id}, date={date}, "
+                            f"stored={stored_c:.6f} C, "
+                            f"incoming={incoming_c:.6f} C"
+                        )
+
+                if new_records:
+                    cursor.executemany(
+                        """
+                        INSERT INTO daily_temperatures
+                        (dataset_id, grid_cell_id,
+                         observation_date, temperature_c)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        new_records,
+                    )
+
+                    if cursor.rowcount != len(new_records):
+                        raise ValueError(
+                            "Unexpected number of inserted rows"
+                        )
+
+                    inserted += cursor.rowcount
+
+        first_date = str(
+            np.datetime64(temperature.valid_time.values[0], 'D')
+        )
+        last_date = str(
+            np.datetime64(temperature.valid_time.values[-1], 'D')
+        )
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM daily_temperatures
+            WHERE dataset_id = %s
+              AND observation_date BETWEEN %s AND %s
+            """,
+            (dataset_id, first_date, last_date),
+        )
+
         count = cursor.fetchone()[0]
+
         if count != attempted:
-            raise ValueError(f'Database count {count} != expected {attempted}; rolled back')
+            raise ValueError(
+                f"Database count {count} != expected {attempted}"
+            )
+
         connection.commit()
         return dataset_id, inserted, count
+
     except Exception:
         connection.rollback()
         raise
+
     finally:
         cursor.close()
 
