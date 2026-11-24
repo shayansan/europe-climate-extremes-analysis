@@ -73,3 +73,6 @@ results/tables/*
 
 !results/figures/.gitkeep
 !results/tables/.gitkeep
+
+# Local database backups
+/backups/
