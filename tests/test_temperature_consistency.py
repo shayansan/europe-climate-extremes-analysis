@@ -3,28 +3,9 @@ import unittest
 import numpy as np
 import xarray as xr
 
+from src.data_processing.temperature_consistency import validate_temperature_consistency
 
-def validate_temperature_consistency(tmax, tmean):
-    """Validate aligned daily Tmax and Tmean in Kelvin."""
 
-    tmax, tmean = xr.align(tmax, tmean, join="exact")
-
-    if tmax.dims != tmean.dims:
-        raise ValueError("Temperature dimension order mismatch")
-
-    maximum = np.asarray(tmax.values)
-    average = np.asarray(tmean.values)
-
-    if not np.isfinite(maximum).all():
-        raise ValueError("Invalid Tmax values")
-
-    if not np.isfinite(average).all():
-        raise ValueError("Invalid Tmean values")
-
-    if np.any(average > maximum + 1e-5):
-        raise ValueError("Tmean exceeds Tmax")
-
-    return maximum.size
 
 
 class TestTemperatureConsistency(unittest.TestCase):
@@ -44,6 +25,8 @@ class TestTemperatureConsistency(unittest.TestCase):
             coords=coordinates,
         )
 
+        tmax.attrs["units"] = "K"
+        tmean.attrs["units"] = "K"
         return tmax, tmean
 
     def test_valid_temperatures(self):
